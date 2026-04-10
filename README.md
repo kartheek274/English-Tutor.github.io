@@ -1,7 +1,3 @@
-# English-Tutor.github.io
-theme: jekyll-theme-minimal
-title: English Tutor
-description: native language to English translator style coaching 
 <!DOCTYPE html>
 <html lang="en">
 <head>
