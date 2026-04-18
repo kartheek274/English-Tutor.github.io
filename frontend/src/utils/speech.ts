@@ -428,12 +428,17 @@ export async function parsePdfFromUrl(url: string, filename: string): Promise<{
       .map(Number)
       .sort((a, b) => b - a);
     for (const y of yKeys) {
-      const line = rows[y]
+      // Join text items without adding a space — items typically include their own spacing.
+      // Adding spaces would fragment Telugu ligatures (which are stored as separate glyphs).
+      let line = rows[y]
         .sort((a, b) => a.x - b.x)
         .map(r => r.s)
-        .join(' ')
+        .join('')
         .replace(/\s+/g, ' ')
         .trim();
+      // Telugu normalization: remove spaces that appear directly before combining marks
+      // (vowel signs U+0C3E-U+0C4D, length marks U+0C55-U+0C56, and anusvara U+0C02, visarga U+0C03)
+      line = line.replace(/\s+([\u0C00-\u0C03\u0C3E-\u0C56\u0C62\u0C63])/g, '$1');
       if (line) allLines.push(line);
     }
   }
@@ -444,6 +449,151 @@ export async function parsePdfFromUrl(url: string, filename: string): Promise<{
 }
 
 export function parseLinesIntoQuestions(lines: string[], topic: string): Question[] {
+  // Strategy 1: Two-section format (e.g., "Exercise on..." then "Answers of the above exercise...")
+  // Common in lesson PDFs: all Telugu questions listed first (numbered), then all English answers numbered.
+  const twoSection = tryTwoSectionFormat(lines, topic);
+  if (twoSection.length >= 3) {
+    return twoSection;
+  }
+
+  // Strategy 2: Inline formats (Q:/A:/H:, "Telugu — English", "1. Telugu | English")
+  const inline = tryInlineFormats(lines, topic);
+  if (inline.length > 0) return inline;
+
+  // Fallback: return whatever two-section found (even if short)
+  return twoSection;
+}
+
+// ----- Two-section parser (Questions block then Answers block) -----
+function tryTwoSectionFormat(lines: string[], topic: string): Question[] {
+  // Find the answers section header
+  const answerHeaderIdx = findAnswerHeader(lines);
+  if (answerHeaderIdx === -1) return [];
+
+  // Find the questions section start (Exercise / Questions header before answers)
+  const questionHeaderIdx = findQuestionHeader(lines, answerHeaderIdx);
+
+  const qSectionStart = questionHeaderIdx !== -1 ? questionHeaderIdx + 1 : 0;
+  const qSectionEnd = answerHeaderIdx;
+  const aSectionStart = answerHeaderIdx + 1;
+  const aSectionEnd = lines.length;
+
+  const questionsMap = extractNumberedItems(
+    lines.slice(qSectionStart, qSectionEnd),
+    /[\u0C00-\u0C7F]/ // prefer Telugu-containing items
+  );
+  const answersMap = extractNumberedItems(
+    lines.slice(aSectionStart, aSectionEnd),
+    null // accept any numbered content
+  );
+
+  const out: Question[] = [];
+  const allNums = Array.from(questionsMap.keys()).sort((a, b) => a - b);
+  for (const n of allNums) {
+    const te = questionsMap.get(n);
+    const en = answersMap.get(n);
+    if (!te || !en) continue;
+    // Clean answer — remove trailing notes like "(Note: ...)"
+    const cleaned = en.replace(/\(Note:.*$/i, '').trim();
+    const enParts = cleaned
+      .split('|')
+      .map(s => s.trim())
+      .filter(Boolean);
+    out.push({
+      te: te.replace(/\s+/g, ' ').trim(),
+      en: enParts.length ? enParts : [cleaned],
+      hint: '',
+      topic,
+    });
+  }
+  return out;
+}
+
+function findAnswerHeader(lines: string[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    // Strip leading non-letter chars (emojis, symbols, whitespace, numbers)
+    const l = lines[i].replace(/^[^a-zA-Z]+/, '').trim();
+    if (!l) continue;
+    // "Answers of the above exercise:-", "Answers:", "Answer Key", "Key:", "Solutions:"
+    if (/^answers?\b(\s*(of|to|on|for)\s+(the\s+)?(above\s+)?(exercise|questions?))?\s*[:\-]?\s*$/i.test(l)) {
+      return i;
+    }
+    if (/^(answer\s*key|solutions?|key)\s*[:\-]?\s*$/i.test(l)) {
+      return i;
+    }
+    // Allow "Answers of the above exercise:-" with colon/hyphen
+    if (/^answers?\b.*\bexercise\b/i.test(l) && l.length < 80) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function findQuestionHeader(lines: string[], before: number): number {
+  // Walk BACKWARDS from the answer header to find the nearest "Exercise" / "Questions" header
+  for (let i = before - 1; i >= 0; i--) {
+    const l = lines[i].replace(/^[^a-zA-Z]+/, '').trim();
+    if (!l) continue;
+    if (/^exercise\b/i.test(l) && l.length < 100) return i;
+    if (/^questions?\s*[:\-]?\s*$/i.test(l)) return i;
+    if (/^practice\b/i.test(l) && l.length < 60) return i;
+  }
+  return -1;
+}
+
+// Extract numbered items: { 1: "content", 2: "content", ... }
+// Handles continuation lines (line breaks inside a numbered item)
+// Handles "1." "1)" "1 " formats
+// If filterRegex is provided, prefers items matching it; otherwise picks latest per number.
+function extractNumberedItems(
+  lines: string[],
+  filterRegex: RegExp | null
+): Map<number, string> {
+  const map = new Map<number, string>();
+  let currentNum: number | null = null;
+  let buffer = '';
+
+  const commit = () => {
+    if (currentNum !== null && buffer.trim()) {
+      const content = buffer.replace(/\s+/g, ' ').trim();
+      // If filter provided, only accept matching content OR overwrite with matching
+      if (!filterRegex) {
+        map.set(currentNum, content);
+      } else {
+        const existing = map.get(currentNum);
+        if (!existing) {
+          map.set(currentNum, content);
+        } else if (!filterRegex.test(existing) && filterRegex.test(content)) {
+          map.set(currentNum, content);
+        }
+      }
+    }
+    buffer = '';
+  };
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    // Match "1." / "1)" / "1:" / "1 " at start, followed by content
+    const m = line.match(/^(\d{1,3})\s*[.\)\:]\s*(.*)$/);
+    if (m) {
+      commit();
+      currentNum = parseInt(m[1], 10);
+      buffer = m[2] || '';
+      continue;
+    }
+    // Continuation line (not numbered) → append to current buffer
+    if (currentNum !== null) {
+      buffer += ' ' + line;
+    }
+  }
+  commit();
+  return map;
+}
+
+// ----- Inline parser (original Q:/A:/H:, dash, 1. Telugu | English formats) -----
+function tryInlineFormats(lines: string[], topic: string): Question[] {
   const out: Question[] = [];
   let current: Partial<Question> | null = null;
   const flush = () => {
@@ -462,7 +612,6 @@ export function parseLinesIntoQuestions(lines: string[], topic: string): Questio
     const line = raw.trim();
     if (!line) continue;
 
-    // Q: / A: / H: format
     const qm = line.match(/^Q\s*[:\-]\s*(.+)$/i);
     const am = line.match(/^A\s*[:\-]\s*(.+)$/i);
     const hm = line.match(/^H\s*[:\-]\s*(.+)$/i);
@@ -484,7 +633,6 @@ export function parseLinesIntoQuestions(lines: string[], topic: string): Questio
       continue;
     }
 
-    // "Telugu — English" or "Telugu - English" or "Telugu: English"
     const dash = line.match(/^(.+?)\s*[—–-]\s*(.+)$/);
     if (dash && /[\u0C00-\u0C7F]/.test(dash[1])) {
       flush();
@@ -493,7 +641,6 @@ export function parseLinesIntoQuestions(lines: string[], topic: string): Questio
       continue;
     }
 
-    // "1. Telugu | English" numbered
     const num = line.match(/^\d+\.\s*(.+?)\s*[|:]\s*(.+)$/);
     if (num && /[\u0C00-\u0C7F]/.test(num[1])) {
       flush();
@@ -502,7 +649,6 @@ export function parseLinesIntoQuestions(lines: string[], topic: string): Questio
       continue;
     }
 
-    // Numbered Telugu only — next line should be English
     const num2 = line.match(/^\d+\.\s*(.+)$/);
     if (num2 && /[\u0C00-\u0C7F]/.test(num2[1])) {
       flush();
@@ -510,7 +656,6 @@ export function parseLinesIntoQuestions(lines: string[], topic: string): Questio
       continue;
     }
 
-    // Continuation / English for current
     if (current && current.te && (!current.en || !current.en.length)) {
       const enParts = line.split('|').map(s => s.trim()).filter(Boolean);
       current.en = enParts;

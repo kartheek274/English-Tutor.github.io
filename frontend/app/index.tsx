@@ -932,7 +932,7 @@ export default function Index() {
                     <Text style={{ fontSize: 28 }}>📄</Text>
                     <Text style={s.pdfUploadTxt}>Tap to upload PDF(s)</Text>
                     <Text style={s.pdfHintTxt}>
-                      Format: Q: Telugu / A: English | alt / H: hint
+                      Supports: &ldquo;Exercise on ...&rdquo; + &ldquo;Answers of the above exercise&rdquo; format (numbered 1-N), Q:/A:/H: blocks, or &ldquo;Telugu — English&rdquo; dash lines.
                     </Text>
                   </TouchableOpacity>
 
